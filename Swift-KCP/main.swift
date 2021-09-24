@@ -129,6 +129,10 @@ fileprivate func TimeDiff(later: uint32, earlier: uint32) -> sint32 {
     return sint32(later) - sint32(earlier)
 }
 
+fileprivate func _ibound_(lower:uint32,middle:uint32,upper:uint32) -> uint32 {
+    return min(max(lower, middle), upper)
+}
+
 fileprivate func DefaultOutput(buf: [uint8], kcp: inout IKCPCB, user: uint64) -> Int {
     return 0
 }
@@ -591,7 +595,82 @@ class IKCPCB {
         }
         
         while (true) {
+            var ts: uint32 = 0   // 4字节
+            var sn: uint32 = 0   // 4字节
+            var len: uint32 = 0  // 4字节
+            var una: uint32 = 0  // 4字节
+            var conv: uint32 = 0 // 4字节
+            var wnd: uint16 = 0  // 2字节
+            var cmd: uint8 = 0   // 1字节
+            var frg: uint8 = 0   // 1字节
+            if data.count < IKCP_OVERHEAD {
+                break
+            }
             
+            // 调用ickp_decode*解包，为各个字段赋值
+            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating: data), l: &conv), count: max(0, data.count - 4)))
+            if conv != self.conv {
+                return -1
+            }
+            
+            data = Array(UnsafeBufferPointer(start: KCPDecode8u(p: UnsafeMutablePointer(mutating:data), c: &cmd), count: max(0, data.count - 1)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode8u(p: UnsafeMutablePointer(mutating:data), c: &frg), count: max(0, data.count - 1)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode16u(p: UnsafeMutablePointer(mutating:data), w: &wnd), count: max(0, data.count - 2)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &ts), count: max(0, data.count - 4)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &sn), count: max(0, data.count - 4)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &una), count: max(0, data.count - 4)))
+            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &len), count: max(0, data.count - 4)))
+            
+            if data.count < len {
+                return -2
+            }
+            
+            if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK && cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
+                return -3
+            }
+            
+            self.rmt_wnd = uint32(wnd) // 更新rmt_wnd
+            self.una_parse(una: una) // 根据una将相应已确认送达的报文从snd_buf中删除
+            self.buf_shrink() // 尝试向右移动snd_una
+            
+            if cmd == IKCP_CMD_ACK { // ACK报文
+                if TimeDiff(later: self.current, earlier: ts) >= 0 {
+                    // 这里计算RTO
+                    self.ack_update(rtt: TimeDiff(later: self.current, earlier: ts))
+                }
+                self.ack_parse(sn: sn)
+                self.buf_shrink()
+                if !flag { // 这里计算出这次input得到的最大ACK编号
+                    flag = true
+                    maxack = sn
+                } else {
+                    if TimeDiff(later: sn, earlier: maxack) > 0 {
+                        maxack = sn
+                    }
+                }
+            } else if cmd == IKCP_CMD_PUSH { // 数据报文
+                if TimeDiff(later: sn, earlier: self.rcv_nxt + self.rcv_wnd) < 0 {
+                    self.ack_push(sn: sn, ts: ts)
+                    if TimeDiff(later: sn, earlier: self.rcv_nxt) >= 0 {
+                        var seg = IKCPSEG(size: Int(len))
+                        seg.conv = conv
+                        seg.cmd = uint32(cmd)
+                        seg.frg = uint32(frg)
+                        seg.wnd = uint32(wnd)
+                        seg.ts = ts
+                        seg.sn = sn
+                        seg.una = una
+                        if len > 0 {
+                            for i in 0..<seg.data.count {
+                                seg.data[i] = data[i]
+                            }
+                        }
+                        
+                        // 插入rcv_buf
+                        self.data_parse(newseg: seg)
+                    }
+                }
+            }
         }
         
         return 0
@@ -674,13 +753,68 @@ class IKCPCB {
         }
     }
     
-    private func ack_update() {
-        
+    private func data_parse(newseg: IKCPSEG) {
+        let sn = newseg.sn
+        var flag = false
+        if TimeDiff(later: sn, earlier: self.rcv_nxt + self.rcv_wnd) >= 0 || TimeDiff(later: sn, earlier: self.rcv_nxt) < 0 {
+            
+        }
     }
     
-    private func buf_shrink() {
+    private func ack_update(rtt: Int32) {
+        var rto: uint32 = 0
+        if self.rx_srtt == 0 {
+            self.rx_srtt = uint32(rtt)
+            self.rx_rttval = uint32(rtt / 2)
+        } else {
+            var delta = rtt - Int32(self.rx_srtt)
+            if delta < 0 {
+                delta = -delta
+            }
+            self.rx_rttval = (3 * self.rx_rttval + uint32(delta)) / 4
+            self.rx_srtt = (7 * self.rx_srtt + uint32(rtt)) / 8
+            self.rx_srtt = max(1, self.rx_srtt)
+        }
         
+        rto = self.rx_srtt + max(self.interval, 4 * self.rx_rttval)
+        self.rx_rto = _ibound_(lower: self.rx_minrto, middle: rto, upper: IKCP_RTO_MAX)
     }
+    
+    // ?
+    private func buf_shrink() {
+        if self.snd_buf.count != 0 {
+            let seg = self.snd_buf.first!
+            self.snd_una = seg.sn
+        } else {
+            self.snd_una = self.snd_nxt
+        }
+    }
+    
+    // 将相关信息（报文时间和时间戳）插入ACK列表中
+    private func ack_push(sn: uint32, ts: uint32) {
+        let newsize = self.ackcount + 1
+        if newsize > self.ackblock {
+            var newblock: uint32 = 8
+            while newblock < newsize {
+                newblock <<= 1
+            }
+            var acklist = Array<uint32>(repeating: 0, count: Int(newblock * 2))
+            if self.acklist.count != 0 {
+                for x in 0..<Int(self.ackcount) {
+                    acklist[x * 2] = self.acklist[x * 2]
+                    acklist[x * 2 + 1] = self.acklist[x * 2 + 1]
+                }
+            }
+            
+            self.acklist = acklist
+            self.ackblock = newblock
+        }
+        
+        self.acklist[Int(self.ackcount * 2)] = sn
+        self.acklist[Int(self.ackcount * 2 + 1)] = ts
+        self.ackcount += 1
+    }
+    
 }
 
 
