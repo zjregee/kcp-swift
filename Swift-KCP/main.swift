@@ -757,7 +757,32 @@ class IKCPCB {
         let sn = newseg.sn
         var flag = false
         if TimeDiff(later: sn, earlier: self.rcv_nxt + self.rcv_wnd) >= 0 || TimeDiff(later: sn, earlier: self.rcv_nxt) < 0 {
-            
+            return
+        }
+        
+        for seg in self.rcv_buf {
+            if seg.sn == sn {
+                flag = true
+                break
+            }
+            if TimeDiff(later: sn, earlier: seg.sn) > 0 {
+                break
+            }
+        }
+        
+        if !flag {
+            self.rcv_buf.append(newseg)
+        }
+        
+        while self.rcv_buf.count != 0 {
+            let seg = self.rcv_buf.first!
+            if seg.sn == self.rcv_nxt && self.rcv_queue.count < self.rcv_wnd {
+                self.rcv_buf.remove(at: 0)
+                self.rcv_queue.append(seg)
+                self.rcv_nxt += 1
+            } else {
+                break
+            }
         }
     }
     
