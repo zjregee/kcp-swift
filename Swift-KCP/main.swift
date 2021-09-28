@@ -13,6 +13,7 @@ let IKCP_CMD_ACK  : uint32 = 82       // cmd: ack
 let IKCP_CMD_WASK : uint32 = 83       // cmd: window probe (ask) 询问对端接受窗口的大小
 let IKCP_CMD_WINS : uint32 = 84       // cmd: window size (tell) 通知对端剩余接受窗口的大小
 
+// CONST
 let IKCP_RTO_NDL : uint32 = 30        // no delay min rto
 let IKCP_RTO_MIN : uint32 = 100       // normal min rto
 let IKCP_RTO_DEF : uint32 = 200
@@ -670,9 +671,136 @@ class IKCPCB {
                         self.data_parse(newseg: seg)
                     }
                 }
+            } else if cmd == IKCP_CMD_WASK { // 窗口探测
+                self.probe |= IKCP_ASK_TELL // 标记需要发送窗口通知报文
+            } else if cmd == IKCP_CMD_WINS {
+                // 什么都不用做，wnd字段前面已经取得了
+            } else {
+                return -3
+            }
+            
+            data = Array(UnsafeBufferPointer(start: UnsafeMutablePointer(mutating: data) + Int(len), count: max(0, data.count - Int(len))))
+        }
+        
+        if flag {
+            self.fastack_parse(sn: maxack)
+        }
+        
+        // 计算cwnd
+        if TimeDiff(later: self.snd_una, earlier: una) > 0 {
+            if self.cwnd < self.rmt_wnd {
+                let mss = self.mss
+                if self.cwnd < self.ssthresh {
+                    self.cwnd += 1
+                    self.incr += mss
+                } else {
+                    if self.incr < mss {
+                        self.incr = mss
+                    }
+                    self.incr += (mss * mss) / self.incr + (mss / 16)
+                    if (self.cwnd + 1) * mss <= self.incr {
+                        self.cwnd += 1
+                    }
+                }
+                
+                if self.cwnd > self.rmt_wnd {
+                    self.cwnd = self.rmt_wnd
+                    self.incr = self.rmt_wnd * mss
+                }
             }
         }
         
+        return 0
+    }
+    
+    func recv(dataSize: Int) -> Date? {
+        var recover = false
+        if self.rcv_queue.isEmpty {
+            return nil
+        }
+        
+        if dataSize == 0 {
+            return nil
+        }
+        
+        // rcv_queue中第一个包的大小，这需要考虑到分片
+        let peeksize = self.peek_size()
+        if peeksize < 0 {
+            return nil
+        }
+        
+        if peeksize > dataSize {
+            return nil
+        }
+        
+        if self.rcv_queue.count >= self.rcv_wnd {
+            recover = true
+        }
+        var len: Int = 0
+        let ispeek = (dataSize < 0)
+        let localBuffer = [uint8](repeating: 0, count: dataSize)
+        var buf = UnsafeMutablePointer(mutating: localBuffer)
+        
+        for i in 0..<self.rcv_queue.count {
+            let seg = self.rcv_queue[Int(i)]
+            
+            var fragment: uint32 = 0
+            for i in 0..<seg.data.count {
+                buf.pointee = seg.data[Int(i)] //复制到buffer中
+                buf += 1
+            }
+            
+            len += seg.data.count
+            fragment = seg.frg
+            
+            if !ispeek { // 如果len小于0，则不消耗rcv_queue
+                self.rcv_queue.remove(at: i) // 这里有问题，还是得在循环外面泗洪removeatindexes
+            }
+            
+            if fragment == 0 {
+                break
+            }
+        }
+        
+        while self.rcv_buf.count != 0 { // rcv_queue空些了，再尝试从rcv_buf中取些报文到rcv_queue
+            let seg = self.rcv_buf.first!
+            if seg.sn == self.rcv_nxt && self.rcv_queue.count < self.rcv_wnd {
+                self.rcv_buf.remove(at: 0)
+                self.rcv_queue.append(seg)
+                self.rcv_nxt += 1
+            } else {
+                break
+            }
+        }
+        
+        if self.rcv_queue.count < self.rcv_wnd && recover {
+            self.probe |= IKCP_ASK_TELL
+        }
+        var temp = [uint8](repeating: 0, count: len)
+        for i in 0..<len {
+            temp[i] = localBuffer[i]
+        }
+        return Data(bytes: temp)
+    }
+    
+    private func peek_size() -> Int {
+        if self.rcv_queue.isEmpty {
+            return -1
+        }
+        let seg = self.rcv_queue.first!
+        if seg.frg == 0 {
+            return seg.data.count
+        }
+        if self.rcv_queue.count < seg.frg + 1 {
+            return -1
+        }
+        var length: Int = 0
+        for seg in self.rcv_queue {
+            length += seg.data.count
+            if seg.frg == 0 {
+                break
+            }
+        }
         return 0
     }
     
@@ -753,6 +881,7 @@ class IKCPCB {
         }
     }
     
+    // 插入rcv_buf
     private func data_parse(newseg: IKCPSEG) {
         let sn = newseg.sn
         var flag = false
@@ -841,5 +970,3 @@ class IKCPCB {
     }
     
 }
-
-
