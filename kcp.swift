@@ -1,6 +1,6 @@
 //
-//  main.swift
-//  Swift-KCP
+//  kcp.swift
+//  kcp-swift
 //
 //  Created by 余润杰 on 2021/9/22.
 //
@@ -12,116 +12,56 @@ let IKCP_CMD_PUSH : uint32 = 81
 let IKCP_CMD_ACK  : uint32 = 82
 
 // CONST
-let IKCP_RTO_NDL : uint32 = 30        // no delay min rto
-let IKCP_RTO_MIN : uint32 = 100       // normal min rto
+let IKCP_RTO_MIN : uint32 = 100
 let IKCP_RTO_DEF : uint32 = 200
 let IKCP_RTO_MAX : uint32 = 60000
-let IKCP_ASK_SEND : uint32 = 1        // need to send IKCP_CMD_WASK
-let IKCP_ASK_TELL : uint32 = 2        // need to send IKCP_CMD_WINS
-let IKCP_WND_SND : uint32 = 32
-let IKCP_WND_RCV : uint32 = 128       // must >: uint32 = max fragment size
 let IKCP_MTU_DEF : uint32 = 1400
-let IKCP_ACK_FAST : uint32 = 3
 let IKCP_INTERVAL : uint32 = 100
 let IKCP_OVERHEAD : uint32 = 24
 let IKCP_DEADLINK : uint32 = 20
-let IKCP_THRESH_INIT : uint32 = 2
-let IKCP_THRESH_MIN : uint32 = 2
-let IKCP_PROBE_INIT : uint32 = 7000        // 7 secs to probe window size
-let IKCP_PROBE_LIMIT : uint32 = 120000    // up to 120 secs to probe window
 
-fileprivate func KCPEncode8u(p:UnsafeMutablePointer<uint8>,
-                             c:uint8) -> UnsafeMutablePointer<uint8> {
-    p.pointee = c
-    return p + 1
+fileprivate func KCPEncode8u(p: inout Int, buffer: inout [uint8], c: uint8) {
+    buffer.append(c)
+    p += 1
 }
 
-fileprivate func KCPDecode8u(p:UnsafeMutablePointer<uint8>,
-                             c:UnsafeMutablePointer<uint8>) -> UnsafePointer<uint8> {
-    c.pointee = p.pointee
-    return UnsafePointer(p + 1)
+fileprivate func KCPDecode8u(buffer: inout [uint8], c: inout uint8) {
+    if buffer.count > 0 {
+        c = buffer.first!
+        buffer.removeFirst()
+    }
 }
 
-fileprivate func KCPEncode16u(p:UnsafeMutablePointer<uint8>,
-                              w:uint16) -> UnsafeMutablePointer<uint8> {
-    var bigEndian = w.littleEndian
-    let count = MemoryLayout<uint16>.size
-    let bytePtr = withUnsafePointer(to: &bigEndian) {
-        $0.withMemoryRebound(to: UInt8.self, capacity: count) {
-            UnsafeBufferPointer(start: $0, count: count)
-        }
-    }
-    let byteArray = Array(bytePtr)
-    for i in 0..<2 {
-        (p+i).pointee = byteArray[i]
-    }
-    return p+2
+fileprivate func KCPEncode16u(p: inout Int, buffer: inout [uint8], c: uint16) {
+    buffer.append(uint8(c >> 8))
+    buffer.append(uint8(c & 0xff))
+    p += 2
 }
 
-fileprivate func KCPDecode16u(p:UnsafeMutablePointer<uint8>,
-                              w:UnsafeMutablePointer<uint16>) -> UnsafePointer<uint8> {
-    let size = 2
-    var buf = [uint8](repeating: 0, count: size)
-    for i in 0..<size {
-        buf[i] = (p+i).pointee
+fileprivate func KCPDecode16u(buffer: inout [uint8], c: inout uint16) {
+    if buffer.count >= 2 {
+        c = uint16(buffer[0]) << 8 + uint16(buffer[1])
+        buffer.removeFirst()
+        buffer.removeFirst()
     }
-    let data = Data(buf)
-    switch CFByteOrderGetCurrent() {
-    case CFByteOrder(CFByteOrderLittleEndian.rawValue):
-        let value = uint16(littleEndian: data.withUnsafeBytes { $0.pointee} )
-        w.pointee = value
-        break
-    case CFByteOrder(CFByteOrderBigEndian.rawValue):
-        let value = uint16(bigEndian: data.withUnsafeBytes { $0.pointee })
-        w.pointee = value
-        break
-    default:
-        break;
-    }
-    
-    return UnsafePointer(p+size)
 }
 
-fileprivate func KCPEncode32u(p:UnsafeMutablePointer<uint8>,
-                              l:uint32) -> UnsafeMutablePointer<uint8> {
-    
-    var bigEndian = l.littleEndian
-    let count = MemoryLayout<UInt32>.size
-    let bytePtr = withUnsafePointer(to: &bigEndian) {
-        $0.withMemoryRebound(to: UInt8.self, capacity: count) {
-            UnsafeBufferPointer(start: $0, count: count)
-        }
-    }
-    let byteArray = Array(bytePtr)
-    for i in 0..<4 {
-        (p+i).pointee = byteArray[i]
-    }
-    
-    return p+4
+fileprivate func KCPEncode32u(p: inout Int, buffer: inout [uint8], c: uint32) {
+    buffer.append(uint8(c >> 24))
+    buffer.append(uint8(c >> 16 & 0xff))
+    buffer.append(uint8(c >> 8 & 0xff))
+    buffer.append(uint8(c & 0xff))
+    p += 4
 }
 
-fileprivate func KCPDecode32u(p:UnsafeMutablePointer<uint8>,
-                              l:UnsafeMutablePointer<uint32>) -> UnsafePointer<uint8> {
-    let size = 4
-    var buf = [uint8](repeating: 0, count: size)
-    for i in 0..<size {
-        buf[i] = (p+i).pointee
+fileprivate func KCPDecode32u(buffer: inout [uint8], c: inout uint32) {
+    if buffer.count >= 4 {
+        c = uint32(buffer[0]) << 24 + uint32(buffer[1]) << 16 + uint32(buffer[2]) << 8 + uint32(buffer[3])
+        buffer.removeFirst()
+        buffer.removeFirst()
+        buffer.removeFirst()
+        buffer.removeFirst()
     }
-    let data = Data(buf)
-    switch CFByteOrderGetCurrent() {
-    case CFByteOrder(CFByteOrderLittleEndian.rawValue):
-        let value = UInt32(littleEndian: data.withUnsafeBytes { $0.pointee })
-        l.pointee = value
-        break
-    case CFByteOrder(CFByteOrderBigEndian.rawValue):
-        let value = UInt32(bigEndian: data.withUnsafeBytes { $0.pointee })
-        l.pointee = value
-        break
-    default:
-        break;
-    }
-    
-    return UnsafePointer(p+size)
 }
 
 fileprivate func TimeDiff(later: uint32, earlier: uint32) -> sint32 {
@@ -140,7 +80,6 @@ struct IKCPSEG {
     var conv: uint32 = 0     // 会话编号，通信双方保持一致才能使用KCP协议交换数据
     var cmd: uint32 = 0      // 表明当前报文的类型，KCP共有四种类型
     var frg: uint32 = 0      // frq分片的编号，当输出数据大于MSS时，需要将数据进行分片，frq记录了分片时的倒序序号
-    var wnd: uint32 = 0      // 填写己方的可用窗口大小
     var ts: uint32 = 0       // 发送时的时间戳，用来估计RTT
     var sn: uint32 = 0       // data报文的编号或者ack报文的确认编号
     var una: uint32 = 0      // 当前还未确认的数据包的编号
@@ -155,20 +94,19 @@ struct IKCPSEG {
     }
     
     init() {
-        self.data = Array<uint8>()
+        self.data = [uint8]()
     }
     
     func encode() -> Data {
-        let buf = [uint8](repeating: 0, count: 24)
-        var ptr = UnsafeMutablePointer(mutating: buf)
-        ptr = KCPEncode32u(p: ptr, l: self.conv)
-        ptr = KCPEncode8u(p: ptr, c: uint8(self.cmd))
-        ptr = KCPEncode8u(p: ptr, c: uint8(self.frg))
-        ptr = KCPEncode16u(p: ptr, w: uint16(self.wnd))
-        ptr = KCPEncode32u(p: ptr, l: self.ts)
-        ptr = KCPEncode32u(p: ptr, l: self.sn)
-        ptr = KCPEncode32u(p: ptr, l: self.una)
-        ptr = KCPEncode32u(p: ptr, l: uint32(self.data.count))
+        var buf = [uint8]()
+        var ptr: Int = 0
+        KCPEncode32u(p: &ptr, buffer: &buf, c: self.conv)
+        KCPEncode8u(p: &ptr, buffer: &buf, c: uint8(self.cmd))
+        KCPEncode8u(p: &ptr, buffer: &buf, c: uint8(self.frg))
+        KCPEncode32u(p: &ptr, buffer: &buf, c: self.ts)
+        KCPEncode32u(p: &ptr, buffer: &buf, c: self.sn)
+        KCPEncode32u(p: &ptr, buffer: &buf, c: self.una)
+        KCPEncode32u(p: &ptr, buffer: &buf, c: uint32(self.data.count))
         return Data(buf)
     }
 }
@@ -183,20 +121,10 @@ class IKCPCB {
     var snd_nxt: uint32 = 0    // 下一个待发送的序列号
     var rcv_nxt: uint32 = 0    // 下一个待接受的序列号，会通过包头中的una字段通知对端
     
-    var ts_recent: uint32 = 0  // unused
-    var ts_lastack: uint32 = 0 // unused
-    var ssthresh: uint32 = 0   // slow start threshhold 慢启动阈值
-    
     var rx_rto: uint32 = 0     // 超时重传时间
     var rx_rttval: uint32 = 0  // 计算rx_rto的中间变量
     var rx_srtt: uint32 = 0    // 计算rx_rto的中间变量
     var rx_minrto: uint32 = 0  // 计算rx_rto的中间变量
-    
-    var snd_wnd: uint32 = 0    // 发送窗口大小
-    var rcv_wnd: uint32 = 0    // 接受窗口大小
-    var rmt_wnd: uint32 = 0    // 对端剩余接受窗口的大小
-    var cwnd: uint32 = 0       // 拥塞窗口，用于拥塞控制
-    var probe: uint32 = 0      // 是否要发送控制报文的标志
     
     var current: uint32 = 0    // 当前时间
     var interval: uint32 = 0   // flush的时间粒度
@@ -206,22 +134,16 @@ class IKCPCB {
     var nodelay: uint32 = 0    // 是否启动快速模式，用于控制RTO增长速度
     var updated: uint32 = 0    // 是否调用过update
     
-    var ts_probe: uint32 = 0   // 确定何时需要发送窗口询问报文
-    var probe_wait: uint32 = 0 // 确定何时需要发送窗口询问报文
-    
     var dead_link: uint32 = 0  // 当一个报文发送超时次数达到dead_link次时认为连接断开
     var snd_queue: [IKCPSEG]   // 发送队列
     var rcv_queue: [IKCPSEG]   // 接受队列
     var snd_buf: [IKCPSEG]     // 发送缓冲区
     var rcv_buf: [IKCPSEG]     // 接受缓冲区
-    var incr: uint32 = 0       // 用于计算cwnd
     var acklist: [uint32]      // 当收到一个数据报文时，将其对应的ACK报文的sn号以及时间戳ts同时加入
     var ackcount: uint32 = 0   // 记录acklist中存放的ACK报文的数量
-    var ackblock: uint32 = 0   // acklist数组的可用长度，当acklist的容量不足时，需要进行扩容
-    var buffer: [uint8]        // flush时用到的临时缓冲区
+    var ackblock: uint32 = 0
     var user: uint64 = 0
     var fastresend: Int = 0    // ACK失序fastresend次时触发快速重传
-    var nocwnd: Int = 0        // 是否不考虑拥塞窗口
     var stream: Int = 0        // 是否开启流模式，开启后可能会合并包
     
     var output : (([uint8], inout IKCPCB, uint64) -> Int)? // 下层协议输出函数
@@ -229,23 +151,17 @@ class IKCPCB {
     init(conv: uint32, user: uint64) {
         self.conv = conv
         self.user = user
-        self.snd_wnd = IKCP_WND_SND
-        self.rcv_wnd = IKCP_WND_RCV
-        self.rmt_wnd = IKCP_WND_RCV
         self.mtu = IKCP_MTU_DEF
         self.mss = self.mtu - IKCP_OVERHEAD
         self.rx_rto = IKCP_RTO_DEF
         self.rx_minrto = IKCP_RTO_MIN
         self.interval = IKCP_INTERVAL
         self.ts_flush = IKCP_INTERVAL
-        self.ssthresh = IKCP_THRESH_INIT
         self.dead_link = IKCP_DEADLINK
         self.snd_queue = [IKCPSEG]()
         self.rcv_queue = [IKCPSEG]()
         self.snd_buf = [IKCPSEG]()
         self.rcv_buf = [IKCPSEG]()
-        
-        self.buffer = [uint8](repeating: 0, count: Int((self.mtu + IKCP_OVERHEAD)*3))
         self.acklist = [uint32]()
         self.output = DefaultOutput
     }
@@ -332,7 +248,6 @@ class IKCPCB {
         seg.conv = self.conv
         seg.cmd = IKCP_CMD_ACK
         seg.frg = 0
-        seg.wnd = uint32(self.wnd_unused())
         seg.una = self.rcv_nxt
         seg.sn = 0
         seg.ts = 0
@@ -360,7 +275,6 @@ class IKCPCB {
             
             newseg.conv = self.conv
             newseg.cmd = IKCP_CMD_PUSH
-            newseg.wnd = seg.wnd
             newseg.ts = current
             newseg.sn = self.snd_nxt; self.snd_nxt+=1;
             newseg.una = self.rcv_nxt
@@ -403,7 +317,6 @@ class IKCPCB {
             
             if needsend {
                 segment.ts = current
-                segment.wnd = seg.wnd
                 segment.una = self.rcv_nxt
                 
                 let size = uint32(ptr)
@@ -441,7 +354,6 @@ class IKCPCB {
         }
     }
     
-    // 上层应用每隔一段时间(10~100ms)驱动KCP发送数据
     func update(current: uint32) {
         var slap: Int32 = 0
         self.current = current
@@ -465,15 +377,14 @@ class IKCPCB {
     }
     
     func input(data: Data) -> Int {
-        let buf = [uint8](repeating: 0, count: data.count)
-        _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
+        let buf = [uint8](data)
         return self.ikcp_input(_data: buf)
     }
     
     private func ikcp_input(_data: [uint8]) -> Int {
         var data = _data
-        let una = self.snd_una
         var maxack: uint32 = 0
+        var latest_ts: uint32 = 0
         var flag = false
         
         if data.count < IKCP_OVERHEAD {
@@ -481,31 +392,28 @@ class IKCPCB {
         }
         
         while (true) {
-            var ts: uint32 = 0   // 4字节
-            var sn: uint32 = 0   // 4字节
-            var len: uint32 = 0  // 4字节
-            var una: uint32 = 0  // 4字节
-            var conv: uint32 = 0 // 4字节
-            var wnd: uint16 = 0  // 2字节
-            var cmd: uint8 = 0   // 1字节
-            var frg: uint8 = 0   // 1字节
+            var ts: uint32 = 0
+            var sn: uint32 = 0
+            var len: uint32 = 0
+            var una: uint32 = 0
+            var conv: uint32 = 0
+            var cmd: uint8 = 0
+            var frg: uint8 = 0
             if data.count < IKCP_OVERHEAD {
                 break
             }
             
-            // 调用ickp_decode*解包，为各个字段赋值
-            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating: data), l: &conv), count: max(0, data.count - 4)))
+            KCPDecode32u(buffer: &data, c: &conv)
             if conv != self.conv {
                 return -1
             }
             
-            data = Array(UnsafeBufferPointer(start: KCPDecode8u(p: UnsafeMutablePointer(mutating:data), c: &cmd), count: max(0, data.count - 1)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode8u(p: UnsafeMutablePointer(mutating:data), c: &frg), count: max(0, data.count - 1)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode16u(p: UnsafeMutablePointer(mutating:data), w: &wnd), count: max(0, data.count - 2)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &ts), count: max(0, data.count - 4)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &sn), count: max(0, data.count - 4)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &una), count: max(0, data.count - 4)))
-            data = Array(UnsafeBufferPointer(start: KCPDecode32u(p: UnsafeMutablePointer(mutating:data), l: &len), count: max(0, data.count - 4)))
+            KCPDecode8u(buffer: &data, c: &cmd)
+            KCPDecode8u(buffer: &data, c: &frg)
+            KCPDecode32u(buffer: &data, c: &ts)
+            KCPDecode32u(buffer: &data, c: &sn)
+            KCPDecode32u(buffer: &data, c: &una)
+            KCPDecode32u(buffer: &data, c: &len)
             
             if data.count < len {
                 return -2
@@ -527,9 +435,11 @@ class IKCPCB {
                 if !flag {
                     flag = true
                     maxack = sn
+                    latest_ts = ts
                 } else {
                     if TimeDiff(later: sn, earlier: maxack) > 0 {
                         maxack = sn
+                        latest_ts = ts
                     }
                 }
             } else if cmd == IKCP_CMD_PUSH {
@@ -539,7 +449,6 @@ class IKCPCB {
                     seg.conv = conv
                     seg.cmd = uint32(cmd)
                     seg.frg = uint32(frg)
-                    seg.wnd = uint32(wnd)
                     seg.ts = ts
                     seg.sn = sn
                     seg.una = una
@@ -555,11 +464,11 @@ class IKCPCB {
                 return -3
             }
             
-            data = Array(UnsafeBufferPointer(start: UnsafeMutablePointer(mutating: data) + Int(len), count: max(0, data.count - Int(len))))
+            data = Array(data[Int(len)..<data.endIndex])
         }
         
         if flag {
-            self.fastack_parse(sn: maxack)
+            self.fastack_parse(sn: maxack, ts: latest_ts)
         }
         
         return 0
@@ -585,23 +494,22 @@ class IKCPCB {
         
         var len: Int = 0
         let ispeek = (dataSize < 0)
-        let localBuffer = [uint8](repeating: 0, count: dataSize)
-        var buf = UnsafeMutablePointer(mutating: localBuffer)
+        var localBuffer = [uint8]()
+        let indexSet = NSMutableIndexSet()
         
         for i in 0..<self.rcv_queue.count {
-            let seg = self.rcv_queue[Int(i)]
+            let seg = self.rcv_queue[i]
             
             var fragment: uint32 = 0
             for i in 0..<seg.data.count {
-                buf.pointee = seg.data[Int(i)]
-                buf += 1
+                localBuffer.append(seg.data[i])
             }
             
             len += seg.data.count
             fragment = seg.frg
             
-            if !ispeek { // 如果len小于0，则不消耗rcv_queue
-                self.rcv_queue.remove(at: i) // 这里有问题，还是得在循环外面泗洪removeatindexes
+            if !ispeek {
+                indexSet.add(i)
             }
             
             if fragment == 0 {
@@ -609,7 +517,13 @@ class IKCPCB {
             }
         }
         
-        while self.rcv_buf.count != 0 { // rcv_queue空些了，再尝试从rcv_buf中取些报文到rcv_queue
+        var i = indexSet.lastIndex
+        while i != NSNotFound {
+            self.rcv_queue.remove(at: i)
+            i = indexSet.indexLessThanIndex(i)
+        }
+        
+        while self.rcv_buf.count != 0 {
             let seg = self.rcv_buf.first!
             if seg.sn == self.rcv_nxt {
                 self.rcv_buf.remove(at: 0)
@@ -648,14 +562,6 @@ class IKCPCB {
         return 0
     }
     
-    private func wnd_unused() -> Int {
-        if self.rcv_queue.count < self.rcv_wnd {
-            return Int(self.rcv_wnd) - self.rcv_queue.count
-        }
-        
-        return 0
-    }
-    
     private func safe_output(data: [uint8]) -> Int {
         if self.output == nil {
             return 0
@@ -663,7 +569,7 @@ class IKCPCB {
         if data.count == 0 {
             return 0
         }
-        var weakSelf = self // ?
+        var weakSelf = self
         let ret = self.output?(data, &weakSelf, self.user)
         if ret == nil {
             return 0
@@ -704,7 +610,7 @@ class IKCPCB {
         }
     }
     
-    private func fastack_parse(sn: uint32) {
+    private func fastack_parse(sn: uint32, ts: uint32) {
         if TimeDiff(later: sn, earlier: self.snd_una) < 0 || TimeDiff(later: sn, earlier: self.snd_nxt) >= 0 {
             return
         }
@@ -722,7 +628,7 @@ class IKCPCB {
     private func data_parse(newseg: IKCPSEG) {
         let sn = newseg.sn
         var flag = false
-        if TimeDiff(later: sn, earlier: self.rcv_nxt + self.rcv_wnd) >= 0 || TimeDiff(later: sn, earlier: self.rcv_nxt) < 0 {
+        if TimeDiff(later: sn, earlier: self.rcv_nxt) < 0 {
             return
         }
         
@@ -742,7 +648,7 @@ class IKCPCB {
         
         while self.rcv_buf.count != 0 {
             let seg = self.rcv_buf.first!
-            if seg.sn == self.rcv_nxt && self.rcv_queue.count < self.rcv_wnd {
+            if seg.sn == self.rcv_nxt {
                 self.rcv_buf.remove(at: 0)
                 self.rcv_queue.append(seg)
                 self.rcv_nxt += 1
