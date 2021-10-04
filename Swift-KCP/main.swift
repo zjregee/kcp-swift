@@ -8,10 +8,8 @@
 import Foundation
 
 // CMD
-let IKCP_CMD_PUSH : uint32 = 81       // cmd: push data
-let IKCP_CMD_ACK  : uint32 = 82       // cmd: ack
-let IKCP_CMD_WASK : uint32 = 83       // cmd: window probe (ask) 询问对端接受窗口的大小
-let IKCP_CMD_WINS : uint32 = 84       // cmd: window size (tell) 通知对端剩余接受窗口的大小
+let IKCP_CMD_PUSH : uint32 = 81
+let IKCP_CMD_ACK  : uint32 = 82
 
 // CONST
 let IKCP_RTO_NDL : uint32 = 30        // no delay min rto
@@ -35,13 +33,13 @@ let IKCP_PROBE_LIMIT : uint32 = 120000    // up to 120 secs to probe window
 fileprivate func KCPEncode8u(p:UnsafeMutablePointer<uint8>,
                              c:uint8) -> UnsafeMutablePointer<uint8> {
     p.pointee = c
-    return p+1
+    return p + 1
 }
 
 fileprivate func KCPDecode8u(p:UnsafeMutablePointer<uint8>,
                              c:UnsafeMutablePointer<uint8>) -> UnsafePointer<uint8> {
     c.pointee = p.pointee
-    return UnsafePointer(p+1)
+    return UnsafePointer(p + 1)
 }
 
 fileprivate func KCPEncode16u(p:UnsafeMutablePointer<uint8>,
@@ -153,7 +151,7 @@ struct IKCPSEG {
     var data: [uint8]        // 实际传输的数据payload
     
     init(size: Int) {
-        self.data = [uint8](repeating: 9, count: size)
+        self.data = [uint8](repeating: 0, count: size)
     }
     
     init() {
@@ -228,7 +226,7 @@ class IKCPCB {
     
     var output : (([uint8], inout IKCPCB, uint64) -> Int)? // 下层协议输出函数
     
-    init(conv:uint32,user:uint64) {
+    init(conv: uint32, user: uint64) {
         self.conv = conv
         self.user = user
         self.snd_wnd = IKCP_WND_SND
@@ -253,26 +251,24 @@ class IKCPCB {
     }
     
     func send(buffer: Data) -> Int {
-        let buf = [uint8](repeating: 0, count: buffer.count)
-        _ = buffer.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
+        let buf = [uint8](buffer)
         return self.ikcp_send(_buffer: buf)
     }
     
     private func ikcp_send(_buffer: [uint8]) -> Int {
         var buffer = _buffer
+        
         if buffer.count == 0 {
             return -1
         }
         
-        // 1.如果当前的KCP开启流模式，取出snd_queue中的最后一个报文将其填充到mss的长度，并设置其frg为0
         if self.stream != 0 {
             if !self.snd_queue.isEmpty {
-                var old = self.snd_queue.last!
+                let old = self.snd_queue.last!
                 if old.data.count < self.mss {
-                    let capacity = self.mss - uint32(old.data.count)
+                    let capacity = Int(self.mss) - old.data.count
                     let extend = min(buffer.count, Int(capacity))
-                    var seg = IKCPSEG(size: Int(old.data.count + extend))
-                    self.snd_queue.append(seg)
+                    var seg = IKCPSEG(size: old.data.count + extend)
                     
                     for i in 0..<old.data.count {
                         seg.data[i] = old.data[i]
@@ -282,9 +278,12 @@ class IKCPCB {
                         seg.data[i + old.data.count] = buffer[i]
                     }
                     
-                    buffer = Array(UnsafeBufferPointer(start: UnsafeMutablePointer(mutating: buffer) + extend, count: buffer.count - extend))
+                    buffer = Array(buffer[extend..<buffer.endIndex])
                     
-                    seg.frg = 0 // 流模式下分片编号不用填写
+                    seg.frg = 0
+                    
+                    self.snd_queue.removeLast()
+                    self.snd_queue.append(seg)
                 }
             }
             
@@ -297,40 +296,37 @@ class IKCPCB {
         if buffer.count <= self.mss {
             count = 1
         } else {
-            count = Int((buffer.count + Int(self.mss) - 1) / Int(self.mss))
-        }
-        
-        if count > IKCP_WND_RCV {
-            return -2
+            count = (buffer.count + Int(self.mss) - 1) / Int(self.mss)
         }
         
         if count == 0 {
-            count = 1 // ?
+            count = 1
         }
         
         for i in 0..<count {
             let size = min(Int(self.mss), buffer.count)
             var seg = IKCPSEG(size: size)
-            for i in 0..<size {
-                seg.data[i] = buffer[i]
+            if buffer.count > 0 {
+                for i in 0..<size {
+                    seg.data[i] = buffer[i]
+                }
             }
-            seg.frg = (self.stream == 0) ? uint32(count - i - 1) : 0 // 流模式下分片编号不用填写
+            seg.frg = (self.stream == 0) ? uint32(count - i - 1) : 0
             self.snd_queue.append(seg)
-            buffer = Array(UnsafeBufferPointer(start: UnsafeMutablePointer(mutating: buffer) + min(buffer.count, size), count: buffer.count - size))
+            buffer = Array(buffer[size..<buffer.endIndex])
         }
         
         return 0
     }
     
-    // 将数据从snd_queue中移入到snd_buf中，然后调用output发送
     func flush() {
         if self.updated == 0 {
             return
         }
         
         let current = self.current
-        let buffer = UnsafeMutablePointer(mutating: self.buffer) // 临时缓冲区
-        var ptr = UnsafeMutablePointer(mutating: self.buffer)
+        var buffer = [uint8]()
+        var ptr: Int = 0
         
         var seg = IKCPSEG()
         seg.conv = self.conv
@@ -341,106 +337,26 @@ class IKCPCB {
         seg.sn = 0
         seg.ts = 0
         
-        //flush acknowledges
         for i in 0..<Int(self.ackcount) {
-            let size = uint32(ptr - buffer)
+            let size = uint32(ptr)
             if size + IKCP_OVERHEAD > self.mtu {
-                let data = Array(UnsafeBufferPointer(start: buffer, count: Int(size)))
+                let data = Array(buffer[buffer.startIndex..<Int(size)])
                 _ = self.safe_output(data: data)
-                ptr = buffer
+                ptr = 0
             }
             
             self.ack_get(p: i, sn: &seg.sn, ts: &seg.ts)
             let data: Data = seg.encode()
-            let buf = [uint8](repeating: 0, count: data.count)
-            _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
+            let buf = [uint8](data)
             for b in buf {
-                ptr.pointee = b
+                buffer.append(b)
                 ptr += 1
             }
         }
         self.ackcount = 0
         
-        // probe window size (if remote window size equals zero)
-        // 根据ts_probe和probe_wait确定
-        if self.rmt_wnd == 0 {
-            if self.probe_wait == 0 { // 初始化探测间隔和下一次探测时间
-                self.probe_wait = IKCP_PROBE_INIT
-                self.ts_probe = self.current + self.probe_wait
-            } else {
-                if TimeDiff(later: self.current, earlier: self.ts_probe) >= 0 {
-                    if self.probe_wait < IKCP_PROBE_INIT {
-                        self.probe_wait = IKCP_PROBE_INIT
-                    }
-                    self.probe_wait += self.probe_wait / 2
-                    if self.probe_wait > IKCP_PROBE_LIMIT {
-                        self.probe_wait = IKCP_PROBE_LIMIT
-                    }
-                    self.ts_probe = self.current + self.probe_wait
-                    self.probe |= IKCP_ASK_SEND // 标识需要探测远端窗口
-                }
-            }
-        } else {
-            self.probe_wait = 0 // ?
-            self.ts_probe = 0   // ?
-        }
-        
-        // 检查是否需要发送窗口探测报文
-        if (self.probe & IKCP_ASK_SEND) != 0 {
-            seg.cmd = IKCP_CMD_WASK
-            let size = uint32(ptr - buffer)
-            if size + IKCP_OVERHEAD > self.mtu {
-                let data = Array(UnsafeBufferPointer(start: buffer,
-                                                     count: Int(size)))
-                _ = self.safe_output(data: data)
-                ptr = buffer
-            }
-            
-            let data : Data = seg.encode()
-            let buf = [uint8](repeating: 0, count: data.count)
-            _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
-            for b in buf {
-                ptr.pointee = b
-                ptr += 1
-            }
-        }
-        
-        // 检查是否需要发送窗口通知报文
-        if (self.probe & IKCP_ASK_TELL) != 0 {
-            seg.cmd = IKCP_CMD_WINS
-            let size = uint32(ptr - buffer)
-            if size + IKCP_OVERHEAD > self.mtu {
-                let data = Array(UnsafeBufferPointer(start: buffer,
-                                                     count: Int(size)))
-                _ = self.safe_output(data: data)
-                ptr = buffer
-            }
-            let data : Data = seg.encode()
-            let buf = [uint8](repeating: 0, count: data.count)
-            _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
-            for b in buf {
-                ptr.pointee = b
-                ptr += 1
-            }
-        }
-        
-        self.probe = 0
-        
-        // 计算cwnd
-        var cwnd = min(self.snd_wnd, self.rmt_wnd)
-        if self.nocwnd == 0 {
-            cwnd = min(self.cwnd, cwnd)
-        }
-        
-        // 将报文从snd_queue移动到snd_buf
-        // snd_nxt - snd_una 不超过cwnd
-        while TimeDiff(later: self.snd_nxt, earlier: self.snd_una + cwnd) < 0 {
-            if self.snd_queue.isEmpty {
-                break
-            }
-            
+        while !self.snd_queue.isEmpty {
             var newseg = self.snd_queue.first!
-            self.snd_queue.remove(at: 0)
             
             newseg.conv = self.conv
             newseg.cmd = IKCP_CMD_PUSH
@@ -453,40 +369,36 @@ class IKCPCB {
             newseg.fastack = 0
             newseg.xmit = 0
             
+            self.snd_queue.remove(at: 0)
             self.snd_buf.append(newseg)
         }
         
-        // 快速重传，fastresend为0便不执行快速重传
         let resent = self.fastresend > 0 ? self.fastresend : 0xffffffff
         let rtomin = self.nodelay == 0 ? self.rx_rto >> 3 : 0
-        var lost = false
-        var change: Int = 0
         
-        // 将snd_buf中满足条件的报文段都发送出去
         for var segment in self.snd_buf {
             var needsend = false
-            if segment.xmit == 0 { // 未发送过
+            if segment.xmit == 0 {
                 needsend = true
                 segment.xmit += 1
                 segment.rto = self.rx_rto
                 segment.resendts = current + segment.rto + rtomin
-            } else if TimeDiff(later: current, earlier: segment.resendts) >= 0 { // 超时
+            } else if TimeDiff(later: current, earlier: segment.resendts) >= 0 {
                 needsend = true
                 segment.xmit += 1
                 self.xmit += 1
-                if 0 == self.nodelay {
-                    segment.rto += self.rx_rto
+                if self.nodelay == 0 {
+                    segment.rto += max(segment.rto, self.rx_rto)
                 } else {
-                    segment.rto += self.rx_rto / 2
+                    let step = self.nodelay < 2 ? segment.rto : self.rx_rto
+                    segment.rto += step / 2
                 }
                 segment.resendts = current + segment.rto
-                lost = true
-            } else if segment.fastack >= resent { // 快速重传
+            } else if segment.fastack >= resent {
                 needsend = true
                 segment.xmit += 1
                 segment.fastack = 0
                 segment.resendts = current + segment.rto
-                change += 1
             }
             
             if needsend {
@@ -494,64 +406,38 @@ class IKCPCB {
                 segment.wnd = seg.wnd
                 segment.una = self.rcv_nxt
                 
-                let size = Int(ptr - buffer)
+                let size = uint32(ptr)
                 let need = Int(IKCP_OVERHEAD) + segment.data.count
                 
-                if size + need > self.mtu {
-                    _ = self.safe_output(data: Array(UnsafeBufferPointer(start: buffer, count: size)))
-                    ptr = buffer
+                if size + uint32(need) > self.mtu {
+                    _ = self.safe_output(data: Array(buffer[buffer.startIndex..<Int(size)]))
+                    buffer.removeAll()
+                    ptr = 0
                 }
                 
-                let data : Data = segment.encode()
-                let buf = [uint8](repeating: 0, count: data.count)
-                _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
+                let data: Data = segment.encode()
+                let buf = [uint8](data)
                 for b in buf {
-                    ptr.pointee = b
+                    buffer.append(b)
                     ptr += 1
                 }
                 
                 if segment.data.count > 0 {
                     for i in 0..<segment.data.count {
-                        ptr.pointee = segment.data[Int(i)]
+                        buffer.append(segment.data[i])
                         ptr += 1
                     }
                 }
                 
                 if segment.xmit >= self.dead_link {
-                    self.state = 0xffffffff // 不能写-1
+                    self.state = 0xffffffff
                 }
             }
         }
         
-        // 发送buffer中剩余的报文段
-        let size = Int(ptr - buffer)
+        let size = ptr
         if size > 0 {
-            _ = self.safe_output(data: Array(UnsafeBufferPointer(start: buffer, count: size)))
-        }
-        
-        // 根据丢包情况计算ssthresh和cwnd
-        if change != 0 {
-            let inflight = self.snd_nxt - self.snd_una
-            self.ssthresh = inflight / 2
-            if self.ssthresh < IKCP_THRESH_MIN {
-                self.ssthresh = IKCP_THRESH_MIN
-            }
-            self.cwnd = self.ssthresh + uint32(resent)
-            self.incr = self.cwnd * self.mss
-        }
-        
-        if lost {
-            self.ssthresh = cwnd / 2
-            if self.ssthresh < IKCP_THRESH_MIN {
-                self.ssthresh = IKCP_THRESH_MIN
-            }
-            self.cwnd = 1
-            self.incr = self.mss
-        }
-        
-        if self.cwnd < 1 {
-            self.cwnd = 1
-            self.incr = self.mss
+            _ = self.safe_output(data: Array(buffer[buffer.startIndex..<size]))
         }
     }
     
@@ -578,7 +464,6 @@ class IKCPCB {
         }
     }
     
-    // 数据到达会调用ikcp_input
     func input(data: Data) -> Int {
         let buf = [uint8](repeating: 0, count: data.count)
         _ = data.copyBytes(to: UnsafeMutableBufferPointer<uint8>(start: UnsafeMutablePointer(mutating: buf), count: buf.count))
@@ -626,22 +511,20 @@ class IKCPCB {
                 return -2
             }
             
-            if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK && cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
+            if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK {
                 return -3
             }
             
-            self.rmt_wnd = uint32(wnd) // 更新rmt_wnd
-            self.una_parse(una: una) // 根据una将相应已确认送达的报文从snd_buf中删除
-            self.buf_shrink() // 尝试向右移动snd_una
+            self.una_parse(una: una)
+            self.buf_shrink()
             
-            if cmd == IKCP_CMD_ACK { // ACK报文
+            if cmd == IKCP_CMD_ACK {
                 if TimeDiff(later: self.current, earlier: ts) >= 0 {
-                    // 这里计算RTO
                     self.ack_update(rtt: TimeDiff(later: self.current, earlier: ts))
                 }
                 self.ack_parse(sn: sn)
                 self.buf_shrink()
-                if !flag { // 这里计算出这次input得到的最大ACK编号
+                if !flag {
                     flag = true
                     maxack = sn
                 } else {
@@ -649,32 +532,25 @@ class IKCPCB {
                         maxack = sn
                     }
                 }
-            } else if cmd == IKCP_CMD_PUSH { // 数据报文
-                if TimeDiff(later: sn, earlier: self.rcv_nxt + self.rcv_wnd) < 0 {
-                    self.ack_push(sn: sn, ts: ts)
-                    if TimeDiff(later: sn, earlier: self.rcv_nxt) >= 0 {
-                        var seg = IKCPSEG(size: Int(len))
-                        seg.conv = conv
-                        seg.cmd = uint32(cmd)
-                        seg.frg = uint32(frg)
-                        seg.wnd = uint32(wnd)
-                        seg.ts = ts
-                        seg.sn = sn
-                        seg.una = una
-                        if len > 0 {
-                            for i in 0..<seg.data.count {
-                                seg.data[i] = data[i]
-                            }
+            } else if cmd == IKCP_CMD_PUSH {
+                self.ack_push(sn: sn, ts: ts)
+                if TimeDiff(later: sn, earlier: self.rcv_nxt) >= 0 {
+                    var seg = IKCPSEG(size: Int(len))
+                    seg.conv = conv
+                    seg.cmd = uint32(cmd)
+                    seg.frg = uint32(frg)
+                    seg.wnd = uint32(wnd)
+                    seg.ts = ts
+                    seg.sn = sn
+                    seg.una = una
+                    if len > 0 {
+                        for i in 0..<seg.data.count {
+                            seg.data[i] = data[i]
                         }
-                        
-                        // 插入rcv_buf
-                        self.data_parse(newseg: seg)
                     }
+                    
+                    self.data_parse(newseg: seg)
                 }
-            } else if cmd == IKCP_CMD_WASK { // 窗口探测
-                self.probe |= IKCP_ASK_TELL // 标记需要发送窗口通知报文
-            } else if cmd == IKCP_CMD_WINS {
-                // 什么都不用做，wnd字段前面已经取得了
             } else {
                 return -3
             }
@@ -686,35 +562,10 @@ class IKCPCB {
             self.fastack_parse(sn: maxack)
         }
         
-        // 计算cwnd
-        if TimeDiff(later: self.snd_una, earlier: una) > 0 {
-            if self.cwnd < self.rmt_wnd {
-                let mss = self.mss
-                if self.cwnd < self.ssthresh {
-                    self.cwnd += 1
-                    self.incr += mss
-                } else {
-                    if self.incr < mss {
-                        self.incr = mss
-                    }
-                    self.incr += (mss * mss) / self.incr + (mss / 16)
-                    if (self.cwnd + 1) * mss <= self.incr {
-                        self.cwnd += 1
-                    }
-                }
-                
-                if self.cwnd > self.rmt_wnd {
-                    self.cwnd = self.rmt_wnd
-                    self.incr = self.rmt_wnd * mss
-                }
-            }
-        }
-        
         return 0
     }
     
-    func recv(dataSize: Int) -> Date? {
-        var recover = false
+    func recv(dataSize: Int) -> Data? {
         if self.rcv_queue.isEmpty {
             return nil
         }
@@ -723,7 +574,6 @@ class IKCPCB {
             return nil
         }
         
-        // rcv_queue中第一个包的大小，这需要考虑到分片
         let peeksize = self.peek_size()
         if peeksize < 0 {
             return nil
@@ -733,9 +583,6 @@ class IKCPCB {
             return nil
         }
         
-        if self.rcv_queue.count >= self.rcv_wnd {
-            recover = true
-        }
         var len: Int = 0
         let ispeek = (dataSize < 0)
         let localBuffer = [uint8](repeating: 0, count: dataSize)
@@ -746,7 +593,7 @@ class IKCPCB {
             
             var fragment: uint32 = 0
             for i in 0..<seg.data.count {
-                buf.pointee = seg.data[Int(i)] //复制到buffer中
+                buf.pointee = seg.data[Int(i)]
                 buf += 1
             }
             
@@ -764,7 +611,7 @@ class IKCPCB {
         
         while self.rcv_buf.count != 0 { // rcv_queue空些了，再尝试从rcv_buf中取些报文到rcv_queue
             let seg = self.rcv_buf.first!
-            if seg.sn == self.rcv_nxt && self.rcv_queue.count < self.rcv_wnd {
+            if seg.sn == self.rcv_nxt {
                 self.rcv_buf.remove(at: 0)
                 self.rcv_queue.append(seg)
                 self.rcv_nxt += 1
@@ -773,14 +620,11 @@ class IKCPCB {
             }
         }
         
-        if self.rcv_queue.count < self.rcv_wnd && recover {
-            self.probe |= IKCP_ASK_TELL
-        }
         var temp = [uint8](repeating: 0, count: len)
         for i in 0..<len {
             temp[i] = localBuffer[i]
         }
-        return Data(bytes: temp)
+        return Data(temp)
     }
     
     private func peek_size() -> Int {
@@ -832,12 +676,6 @@ class IKCPCB {
         ts?.pointee = self.acklist[p * 2 + 1]
     }
     
-    //---------------------------------------------------------------------
-    // parse ack
-    //---------------------------------------------------------------------
-    
-    // 对于ACK，会调用ikcp_parse_ack将对应已送达的报文从snd_buf中删除
-    // 删除之后，ikcp_flush调用中自然不用考虑重传问题了
     private func ack_parse(sn: uint32) {
         if TimeDiff(later: sn, earlier: self.snd_una) < 0 || TimeDiff(later: sn, earlier: self.snd_nxt) >= 0 {
             return
@@ -881,7 +719,6 @@ class IKCPCB {
         }
     }
     
-    // 插入rcv_buf
     private func data_parse(newseg: IKCPSEG) {
         let sn = newseg.sn
         var flag = false
@@ -934,7 +771,6 @@ class IKCPCB {
         self.rx_rto = _ibound_(lower: self.rx_minrto, middle: rto, upper: IKCP_RTO_MAX)
     }
     
-    // ?
     private func buf_shrink() {
         if self.snd_buf.count != 0 {
             let seg = self.snd_buf.first!
@@ -944,7 +780,6 @@ class IKCPCB {
         }
     }
     
-    // 将相关信息（报文时间和时间戳）插入ACK列表中
     private func ack_push(sn: uint32, ts: uint32) {
         let newsize = self.ackcount + 1
         if newsize > self.ackblock {
